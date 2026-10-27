@@ -1,0 +1,27 @@
+# Serves the call page, the token endpoint and LiveKit signaling over https on the LAN.
+# Run from this folder:  LAN_IP=192.168.x.y caddy run --config Caddyfile --adapter caddyfile
+{
+	# local certificate for the LAN IP; don't touch the system trust store
+	skip_install_trust
+	auto_https disable_redirects
+	# browsers send no SNI when connecting to an IP address
+	default_sni {$LAN_IP}
+}
+
+https://{$LAN_IP}:8443 {
+	tls internal
+	handle /token {
+		reverse_proxy 127.0.0.1:18100
+	}
+	# LiveKit signaling (WebSocket) and API, same origin so the page needs only one certificate
+	handle /rtc* {
+		reverse_proxy 127.0.0.1:7880
+	}
+	handle /twirp* {
+		reverse_proxy 127.0.0.1:7880
+	}
+	handle {
+		root * web
+		file_server
+	}
+}

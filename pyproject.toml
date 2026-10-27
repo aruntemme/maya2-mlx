@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "maya2-mlx"
+version = "0.1.0"
+description = "MLX (Apple Silicon) inference for Maya-2 Native: streaming Indic + English text-to-speech"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = [
+    "mlx>=0.32",
+    "soundfile>=0.12",
+    # the official release code (text normalisation, prompt packing, voices, guards); pinned to the commit the parity
+    # checks were run against
+    "maya3 @ git+https://github.com/MayaResearch/maya2-native@bbfdb152e741b5d49d2196bf192636d70e9f2d25",
+]
+
+[project.urls]
+Homepage = "https://github.com/aruntemme/maya2-mlx"
+"Model card" = "https://huggingface.co/aruntemme/maya2-native-mlx"
+
+[tool.setuptools]
+packages = ["maya2_mlx"]

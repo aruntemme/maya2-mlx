@@ -1,0 +1,223 @@
+diff --git a/maya3/engine.py b/maya3/engine.py
+index ccb12af..7450be6 100644
+--- a/maya3/engine.py
++++ b/maya3/engine.py
+@@ -150,6 +150,7 @@ class Engine:
+         self.S = S
+         self.cfg = cfg = config or EngineConfig()
+         self.device = device
++        self._cuda = torch.device(device).type == "cuda"
+         self.log = log
+         torch.backends.cuda.enable_cudnn_sdp(False)
+         torch.backends.cuda.matmul.allow_tf32 = False
+@@ -191,20 +192,21 @@ class Engine:
+         ctx = tuple(c for c in (256, 512, 768, 1024, 1536, 2048, 3072) if c < cfg.capacity) + (cfg.capacity,)
+         dt = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[cfg.depth_dtype]
+         self.backbone = StaticBackbone(self.model.backbone, n, capacity=cfg.capacity, batch_buckets=rows, ctx_buckets=ctx,
+-                                       attention="triton", use_graphs=cfg.use_graphs,
++                                       attention="triton" if self._cuda else "gather", use_graphs=cfg.use_graphs and self._cuda,
+                                        fuse_proj=cfg.fuse_proj, fused_norm=cfg.fused_norm, fuse_rope=cfg.fuse_rope)
+         if cfg.compile_depth:
+             import torch._dynamo as _dyn
+             _dyn.config.cache_size_limit = max(64, _dyn.config.cache_size_limit)
+         self.depth = FastDepth(self.model, n, dtype=dt, batch_buckets=buckets, seed=cfg.seed + 1, temp=cfg.temp, top_k=cfg.top_k,
+-                               compile=cfg.compile_depth, fused=cfg.fused_depth)
++                               compile=cfg.compile_depth, fused=cfg.fused_depth and self._cuda)
+         self.codec = StaticMimi(self.mimi, n, batch_buckets=buckets)
+         if cfg.free_reference_depth and getattr(self.model.depth, "groups", None) is not None:
+             d = self.model.depth   # only spk_proj_* / null_mem are used after this (speaker memory); FastDepth has its own copy
+             for name in ("groups", "cross", "heads", "code_lo", "code_up", "in_proj", "level_emb", "norm"):
+                 if hasattr(d, name):
+                     setattr(d, name, None)
+-            torch.cuda.empty_cache()
++            if self._cuda:
++                torch.cuda.empty_cache()
+         m = n + 1
+         D = self.model.backbone.d_model
+         self.h = torch.zeros(m, D, device=dev, dtype=torch.bfloat16)
+@@ -229,8 +231,10 @@ class Engine:
+         self._any_rep = False      # some active request overrides the presence penalty (host-side flag, no sync)
+         self._any_top_p = cfg.cb0_top_p < 1.0
+         # one pinned host buffer per tick: [B, 2 + FRAME/4] int64 view = stop code, cb0, PCM int16 packed
+-        self._host = torch.empty(n, 2 + FRAME // 4, dtype=torch.int64).pin_memory()
+-        self._evt = torch.cuda.Event()
++        self._host = torch.empty(n, 2 + FRAME // 4, dtype=torch.int64)
++        if self._cuda:
++            self._host = self._host.pin_memory()
++        self._evt = torch.cuda.Event() if self._cuda else None
+         self.warm = False
+ 
+     def warmup(self):
+@@ -238,7 +242,8 @@ class Engine:
+         self.backbone.warmup()
+         self.depth.warmup()
+         self.codec.warmup()
+-        torch.cuda.synchronize()
++        if self._cuda:
++            torch.cuda.synchronize()
+         # exercise the admission paths once (prefix KV build, inline prefill, cb0 kernels)
+         v = self.registry.get("plain")
+         for _ in range(2):
+@@ -558,9 +563,10 @@ class Engine:
+         pcm16 = (pcm.clamp(-1, 1) * 32767).round().to(torch.int16)
+         packed = torch.cat([code[:, None], cb0[:, None], pcm16.view(torch.int64).view(B, FRAME // 4)], 1)
+         host = self._host[:B]
+-        host.copy_(packed, non_blocking=True)
+-        self._evt.record()
+-        self._evt.synchronize()
++        host.copy_(packed, non_blocking=self._cuda)
++        if self._cuda:
++            self._evt.record()
++            self._evt.synchronize()
+         t3 = time.perf_counter()
+         hv = host.numpy()
+         stop_l = hv[:, 0].tolist()
+@@ -653,7 +659,6 @@ class Engine:
+         """Controlled stop + cb0 sampling (same rule as the reference decoder and ServeSession.speak(stop='controlled')) for all seats, with
+         per-seat temperature / top-k / top-p / presence penalty and a per-request Philox stream."""
+         from tts.tokens import AEOS_CLASS
+-        from serve.fast_depth_kernels import row_exponential
+         logits = self.model.backbone.cb0_logits(h).float() / self.temp_t[idx, None]
+         logits[:, AEOS_CLASS] += self.aeos_bias[idx]
+         rep = self.rep_t[idx]
+@@ -684,7 +689,11 @@ class Engine:
+         q = probs.clone()
+         q[:, AEOS_CLASS] = 0
+         q = q / q.sum(-1, keepdim=True).clamp_min(1e-12)
+-        E = row_exponential(q.shape[0], q.shape[1], self.seed_t[idx], self.ctr_t[idx], level=0)
++        if self._cuda:
++            from serve.fast_depth_kernels import row_exponential
++            E = row_exponential(q.shape[0], q.shape[1], self.seed_t[idx], self.ctr_t[idx], level=0)
++        else:   # no Triton: same exponential race, drawn from the engine generator (per-request seeds not honored)
++            E = torch.empty_like(q).exponential_(1, generator=self.generator)
+         cb0 = (q / E).argmax(-1).clamp_max(AEOS_CLASS - 1)
+         self.ctr_t[idx] += 1
+         if self.cfg.cb0_rep_win > 0:
+diff --git a/serve/fast_backbone.py b/serve/fast_backbone.py
+index 93600d7..ad28453 100644
+--- a/serve/fast_backbone.py
++++ b/serve/fast_backbone.py
+@@ -230,7 +230,7 @@ class StaticBackbone:
+             h,out=self._add_norm(h,pend,self.norm.weight)
+         else:
+             out=self._rms(self.norm,h)
+-        self.lengths.index_add_(0,slots,real)
++        self.lengths.scatter_add_(0,slots,real)   # == index_add_ for 1-D; MPS has no int64 index_add_
+         return out
+ 
+     def _add_norm(self,h,a,w):
+@@ -258,10 +258,11 @@ class StaticBackbone:
+         g.slots=torch.full((bb,),self.dummy,dtype=torch.long,device=self.device)
+         g.real=torch.zeros(bb,dtype=torch.long,device=self.device)
+         g.offset=torch.zeros(bb,dtype=torch.long,device=self.device)
+-        g.offset_cpu=torch.zeros(bb,dtype=torch.long).pin_memory();g.offset_dirty=False
++        g.offset_cpu=torch.zeros(bb,dtype=torch.long);g.offset_dirty=False
+         g.x=torch.zeros(bb,self.hidden,dtype=self.dtype,device=self.device)
+-        g.slots_cpu=torch.full((bb,),self.dummy,dtype=torch.long).pin_memory()
+-        g.real_cpu=torch.zeros(bb,dtype=torch.long).pin_memory()
++        g.slots_cpu=torch.full((bb,),self.dummy,dtype=torch.long)
++        g.real_cpu=torch.zeros(bb,dtype=torch.long)
++        if self.device.type=='cuda':g.offset_cpu,g.slots_cpu,g.real_cpu=(t.pin_memory() for t in (g.offset_cpu,g.slots_cpu,g.real_cpu))
+         g.last=None;g.graph=None;g.evt=None
+         if self.use_graphs:
+             stream=torch.cuda.Stream()
+@@ -283,7 +284,7 @@ class StaticBackbone:
+             for cb in sorted(ctx_buckets or self.ctx_buckets,reverse=True):
+                 cb=min(cb,self.capacity)
+                 if (bb,cb) not in self.graphs:self._capture(bb,cb)
+-        torch.cuda.synchronize()
++        if self.device.type=='cuda':torch.cuda.synchronize()
+ 
+     @torch.inference_mode()
+     def step(self,slots,x):
+@@ -304,7 +305,7 @@ class StaticBackbone:
+             g.slots_cpu[:B]=torch.tensor(slots,dtype=torch.long);g.slots_cpu[B:]=self.dummy
+             g.real_cpu[:B]=1;g.real_cpu[B:]=0
+             g.slots.copy_(g.slots_cpu,non_blocking=True);g.real.copy_(g.real_cpu,non_blocking=True)
+-            g.evt=torch.cuda.Event();g.evt.record()
++            if self.device.type=='cuda':g.evt=torch.cuda.Event();g.evt.record()
+             g.last=key
+         g.x[:B].copy_(x)
+         if g.graph is not None:
+@@ -346,7 +347,7 @@ class StaticBackbone:
+         g.real_cpu[:rows]=1;g.real_cpu[rows:]=0
+         g.slots.copy_(g.slots_cpu,non_blocking=True);g.real.copy_(g.real_cpu,non_blocking=True)
+         g.offset.copy_(g.offset_cpu,non_blocking=True);g.last=None;g.offset_dirty=bool(prefills)
+-        g.evt=torch.cuda.Event();g.evt.record()
++        if self.device.type=='cuda':g.evt=torch.cuda.Event();g.evt.record()
+         if B:g.x[:B].copy_(x)
+         at=B
+         for _,t in prefills:g.x[at:at+t.shape[0]].copy_(t);at+=t.shape[0]
+diff --git a/serve/fast_codec.py b/serve/fast_codec.py
+index 35d4f99..fa7f448 100644
+--- a/serve/fast_codec.py
++++ b/serve/fast_codec.py
+@@ -196,10 +196,20 @@ class StaticMimi:
+         bucket = _Bucket()
+         bucket.slots = torch.full((size,), self.dummy, device=self.device, dtype=torch.long)
+         bucket.codes = torch.zeros(size, self.codebooks, 1, device=self.device, dtype=torch.long)
+-        bucket.pinned = [torch.full((size,), self.dummy, dtype=torch.long).pin_memory() for _ in range(8)]
++        bucket.pinned = [torch.full((size,), self.dummy, dtype=torch.long) for _ in range(8)]
++        if self.device.type == 'cuda':
++            bucket.pinned = [t.pin_memory() for t in bucket.pinned]
+         bucket.events = [None] * len(bucket.pinned)
+         bucket.turn = 0
+         # Warmup and capture touch only the dummy slot, so live seats are never disturbed.
++        if self.device.type != 'cuda':   # no CUDA graphs: decode() runs _forward eagerly
++            bucket.graph = None
++            bucket.out = self._forward(bucket.slots, bucket.codes)
++            if self.samples_per_frame is None:
++                self.samples_per_frame = bucket.out.shape[-1]
++            self._reset_row(self.dummy)
++            self._buckets[size] = bucket
++            return bucket
+         side = torch.cuda.Stream(device=self.device)
+         side.wait_stream(torch.cuda.current_stream(self.device))
+         with torch.cuda.stream(side):
+@@ -268,10 +278,16 @@ class StaticMimi:
+             staging = bucket.pinned[turn]
+             staging[:count] = torch.tensor(slots, dtype=torch.long)
+             staging[count:] = self.dummy
+-            bucket.slots.copy_(staging, non_blocking=True)
+-            event = torch.cuda.Event()
+-            event.record()
+-            bucket.events[turn] = event
++            if self.device.type == 'cuda':
++                bucket.slots.copy_(staging, non_blocking=True)
++                event = torch.cuda.Event()
++                event.record()
++                bucket.events[turn] = event
++            else:
++                bucket.slots.copy_(staging)
+         bucket.codes[:count, :, 0].copy_(codes)
+-        bucket.graph.replay()
++        if bucket.graph is None:
++            bucket.out = self._forward(bucket.slots, bucket.codes)
++        else:
++            bucket.graph.replay()
+         return bucket.out[:count, 0].float().clone() if bucket.out.dtype != torch.float32 else bucket.out[:count, 0].clone()
+diff --git a/serve/fast_depth.py b/serve/fast_depth.py
+index 05ace5b..0eeb274 100644
+--- a/serve/fast_depth.py
++++ b/serve/fast_depth.py
+@@ -210,6 +210,10 @@ class FastDepth:
+              'h': torch.zeros(bucket, self.depth.in_proj.in_features, device=self.device, dtype=self.dtype),
+              'cb0': torch.zeros(bucket, device=self.device, dtype=torch.long),
+              'last_slots': None}
++        if self.device.type != 'cuda':   # no CUDA graphs: __call__ runs the frame body eagerly
++            s['graph'] = None
++            self.graphs[bucket] = s
++            return s
+         stream = torch.cuda.Stream()
+         stream.wait_stream(torch.cuda.current_stream())
+         with torch.cuda.stream(stream):
+@@ -253,5 +257,8 @@ class FastDepth:
+             s['last_slots'] = key
+         s['h'][:B].copy_(h)
+         s['cb0'][:B].copy_(cb0)
+-        s['graph'].replay()
++        if s['graph'] is None:
++            s['codes'], s['feedback'] = self._fn(s['slots_idx'], s['h'], s['cb0'])
++        else:
++            s['graph'].replay()
+         return s['codes'][:B].clone(), s['feedback'][:B].clone()

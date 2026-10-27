@@ -1,0 +1,32 @@
+== parity/check_backbone.py
+[clone/hi] prompt tokens torch 62 mlx 62 | embeddings: exact 0.9673, max|d| 3.12e-02, rel 1.28e-03
+  prefill last hidden: rel 2.50e-02 (torch noise floor 1.60e-02) | cb0 argmax equal True, top-64 overlap 64/64, KL 1.48e-03
+  decode x16 hidden rel: mean 2.55e-02, max 3.35e-02
+[Kayal/ta] prompt tokens torch 21 mlx 21 | embeddings: exact 0.9882, max|d| 4.88e-04, rel 6.35e-04
+  prefill last hidden: rel 3.53e-02 (torch noise floor 4.01e-02) | cb0 argmax equal True, top-64 overlap 64/64, KL 7.74e-05
+  decode x16 hidden rel: mean 3.34e-02, max 4.48e-02
+[plain/en] prompt tokens torch 11 mlx 11 | embeddings: exact 0.9774, max|d| 4.88e-04, rel 7.69e-04
+  prefill last hidden: rel 2.04e-02 (torch noise floor 2.90e-02) | cb0 argmax equal True, top-64 overlap 63/64, KL 1.84e-03
+  decode x16 hidden rel: mean 2.76e-02, max 4.92e-02
+[Ritvik/hi] prompt tokens torch 18 mlx 18 | embeddings: exact 0.9862, max|d| 4.88e-04, rel 6.75e-04
+  prefill last hidden: rel 4.58e-02 (torch noise floor 5.17e-02) | cb0 argmax equal True, top-64 overlap 62/64, KL 1.48e-03
+  decode x16 hidden rel: mean 4.25e-02, max 6.21e-02
+== parity/check_depth.py
+[nulled memory (named voice)] 12 frames x 31 levels
+  teacher-forced logits vs fp32 reference: MLX fp16 rel mean 1.44e-03 max 2.70e-03 | torch fp16 rel mean 1.32e-03 max 2.39e-03
+  greedy codes equal to engine FastDepth: 0.951 of levels; first mismatch level per frame: [32, 32, 32, 32, 20, 32, 32, 32, 9, 32, 32, 32]
+  feedback embedding rel (same codes): mean 1.12e-03
+[ECAPA memory (clone path)] 12 frames x 31 levels
+  teacher-forced logits vs fp32 reference: MLX fp16 rel mean 1.37e-03 max 2.91e-03 | torch fp16 rel mean 1.29e-03 max 2.73e-03
+  greedy codes equal to engine FastDepth: 0.969 of levels; first mismatch level per frame: [32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 16, 32]
+  feedback embedding rel (same codes): mean 1.38e-03
+== parity/check_mimi.py
+100 frames, 192000 samples
+MLX vs StaticMimi (engine): rel 7.85e-07, SNR 122.1 dB, max|d| 4.17e-07
+StaticMimi vs HF full decode: rel 5.83e-07 (reference streaming-vs-batch floor)
+MLX vs HF full decode: rel 8.88e-07
+== parity/check_variants.py
+depth float16 : teacher-forced logits rel vs fp32  mean 1.46e-03  max 4.35e-03
+depth bfloat16: teacher-forced logits rel vs fp32  mean 1.13e-02  max 3.62e-02
+backbone 8-bit: cb0 KL vs bf16 mean 4.47e-03 max 1.61e-02 | argmax agreement 0.93
+backbone 4-bit: cb0 KL vs bf16 mean 3.18e-01 max 1.65e+00 | argmax agreement 0.70

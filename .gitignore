@@ -1,0 +1,38 @@
+# --- secrets: never commit ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+**/.caddy/
+agent/talk_link.txt
+
+# --- private call data: transcripts, logs, recordings ---
+agent/turns*.jsonl
+*.log
+agent/*.wav
+agent/*.mp3
+agent/*report*.json
+agent/caller_lines/
+
+# --- generated audio and benchmark output ---
+out/
+out_*/
+clip.wav
+
+# --- external checkouts and build output ---
+src/
+hf_release/
+build/
+dist/
+*.egg-info/
+
+# --- environments and caches ---
+.venv/
+.venv-*/
+**/.venv/
+__pycache__/
+*.pyc
+.DS_Store
