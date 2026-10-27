@@ -36,3 +36,6 @@ dist/
 __pycache__/
 *.pyc
 .DS_Store
+
+# --- local parity-test scratch data ---
+port_ref/

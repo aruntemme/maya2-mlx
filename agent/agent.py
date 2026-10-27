@@ -1,14 +1,13 @@
-"""A real-time voice call agent on a Mac: LiveKit Agents + Whisper (MLX, English/Tamil) + GPT-6 Luna on AWS Bedrock +
-Maya-2 (MLX). The persona, Kayal, answers in the caller's language: English, or colloquial Tamil for Tamil/Tanglish.
+"""A real-time voice call agent on a Mac: LiveKit Agents + Deepgram (or local Whisper) + any OpenAI-compatible LLM +
+Maya-2 (MLX). The persona, Kayal, speaks casual spoken Tamil by default and English when the caller speaks English.
 
     python agent.py console   # talk with your Mac's mic and speakers, no server needed
     python agent.py dev       # join rooms on a LiveKit server (LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET)
 
-LLM_BACKEND=local switches the LLM to a local mlx_lm.server (LOCAL_LLM_URL / LOCAL_LLM_MODEL).
-Credentials (DEEPGRAM_API_KEY, BEDROCK_AWS_KEY, BEDROCK_AWS_SECRET) come from the environment, else from the repo's
-.env, else from a file named by EXTRA_ENV_FILE; see .env.example. Without Bedrock keys the standard AWS credential
-chain is used; without a Deepgram key, speech recognition falls back to local Whisper.
-Per-turn latency (ChatMessage.metrics) is appended to turns.jsonl.
+The LLM is any OpenAI-compatible chat API: LLM_BASE_URL, LLM_API_KEY, LLM_MODEL, optional LLM_REASONING_EFFORT
+(default: a local mlx_lm.server on port 18090). Settings and keys come from the environment, else from the repo's
+.env, else from a file named by EXTRA_ENV_FILE; see .env.example. Without a DEEPGRAM_API_KEY, speech recognition
+falls back to local Whisper. Per-turn latency (ChatMessage.metrics) is appended to turns.jsonl.
 """
 import asyncio
 import concurrent.futures
@@ -26,14 +25,9 @@ from livekit.agents import (DEFAULT_API_CONNECT_OPTIONS, Agent, AgentSession, AP
                             JobExecutorType, JobProcess, WorkerOptions, cli, stt, tts, utils)
 from livekit.agents.inference.eot import TurnDetector
 from livekit.agents.types import NOT_GIVEN, NotGivenOr
-from livekit.plugins import aws, deepgram, openai, silero   # plugins must register on the main thread, at import
+from livekit.plugins import deepgram, openai, silero   # plugins must register on the main thread, at import
 from scipy.signal import resample_poly
 
-LLM_BACKEND = os.environ.get("LLM_BACKEND", "bedrock")
-BEDROCK_MODEL = os.environ.get("BEDROCK_MODEL", "global.openai.gpt-6-luna")
-BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "ap-south-1")
-LLM_URL = os.environ.get("LOCAL_LLM_URL", "http://127.0.0.1:18090/v1")
-LLM_MODEL = os.environ.get("LOCAL_LLM_MODEL", "mlx-community/Qwen3-4B-Instruct-2507-4bit")
 
 
 def _secret(name):
@@ -52,6 +46,9 @@ def _secret(name):
     return None
 
 
+LLM_URL = _secret("LLM_BASE_URL") or "http://127.0.0.1:18090/v1"          # default: local mlx_lm.server
+LLM_MODEL = _secret("LLM_MODEL") or "mlx-community/Qwen3-4B-Instruct-2507-4bit"
+LLM_REASONING_EFFORT = _secret("LLM_REASONING_EFFORT")                  # e.g. "low" for reasoning models
 STT_BACKEND = os.environ.get("STT_BACKEND", "deepgram" if _secret("DEEPGRAM_API_KEY") else "whisper")
 DEEPGRAM_LANGUAGE = os.environ.get("DEEPGRAM_LANGUAGE", "multi")
 WHISPER = os.environ.get("WHISPER_MODEL", "mlx-community/whisper-large-v3-turbo")
@@ -83,7 +80,7 @@ follow-up question when it fits.
 The user's words come from speech recognition and may contain mistakes, so infer what they meant from the sound.
 The user speaks only Tamil or English: text in Telugu, Kannada or Malayalam script, or words that look Spanish or
 otherwise foreign, are misrecognised Tamil; read them by their sound as Tamil. If asked, you are an AI."""
-GREETING = "ஹாய்! நான் கயல். என்ன பண்ற? சொல்லு, என்ன பேசலாம்?"
+GREETING = "ஹாய்! நான் கயல், ஒரு AI. என்ன பண்ற? சொல்லு, என்ன பேசலாம்?"   # disclose up front (Maya-2 use terms)
 
 # common English words: a turn counts as English only when they make up a good part of it (Deepgram sometimes writes
 # Tamil speech in Latin script as Spanish-like words, which must not flip the reply to English; measured on a call)
@@ -135,7 +132,7 @@ class Kayal(Agent):
 
     async def on_user_turn_completed(self, turn_ctx, new_message):
         """Tell the LLM which language this turn was in; the prompt rule alone wasn't enough (measured: after Tamil turns
-        Luna kept answering English questions in Tamil). English only when the turn has no Indian-script letters and
+        the LLM kept answering English questions in Tamil). English only when the turn has no Indian-script letters and
         common English words make up at least a third of it; otherwise Tamil, the default."""
         turn_ctx.add_message(role="system", content=_language_note(new_message.text_content or ""))
 
@@ -146,11 +143,6 @@ def _language_note(text):
                and sum(w in EN_COMMON for w in words) >= len(words) / 3)
     return ("The user's latest message is in English; reply in English." if english else
             "The user's latest message is Tamil; reply in casual spoken Chennai Tamil, in Tamil script.")
-
-
-def _bedrock_credentials():
-    """(key, secret), or NOT_GIVEN for each so the AWS plugin uses the standard credential chain."""
-    return _secret("BEDROCK_AWS_KEY") or NOT_GIVEN, _secret("BEDROCK_AWS_SECRET") or NOT_GIVEN
 
 
 def make_stt():
@@ -164,12 +156,9 @@ def make_stt():
 
 
 def make_llm():
-    if LLM_BACKEND == "local":
-        return openai.LLM(model=LLM_MODEL, base_url=LLM_URL, api_key="local")
-    key, secret = _bedrock_credentials()
-    # low reasoning effort: ~0.55 s to first token vs ~1.0 s at the default (measured in ap-south-1)
-    return aws.LLM(model=BEDROCK_MODEL, region=BEDROCK_REGION, api_key=key, api_secret=secret, max_output_tokens=800,
-                   additional_request_fields={"reasoning": {"effort": "low"}})
+    """Any OpenAI-compatible chat API (OpenAI, a LiteLLM gateway in front of another provider, mlx_lm.server, ...)."""
+    extra = {"reasoning_effort": LLM_REASONING_EFFORT} if LLM_REASONING_EFFORT else {}
+    return openai.LLM(model=LLM_MODEL, base_url=LLM_URL, api_key=_secret("LLM_API_KEY") or "none", **extra)
 
 
 class WhisperSTT(stt.STT):
@@ -233,19 +222,23 @@ class MayaStream(tts.ChunkedStream):
             await asyncio.shield(fut)
 
 
-def _warm_local_llm():
-    """The local server's first long prefill compiles its kernels (~5 s, measured); do it before any caller."""
+def _warm_llm():
+    """One request with the real system prompt before any caller: a local mlx_lm.server compiles its kernels on the
+    first long prefill (~5 s, measured) and prompt-caching endpoints keep the instructions warm. Never fatal."""
     import urllib.request
-    body = {"model": LLM_MODEL, "max_tokens": 1, "messages": [{"role": "system", "content": INSTRUCTIONS},
-                                                              {"role": "user", "content": "Hello"}]}
-    req = urllib.request.Request(f"{LLM_URL}/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
-    urllib.request.urlopen(req, timeout=60).read()
+    body = {"model": LLM_MODEL, "max_tokens": 16, "messages": [{"role": "system", "content": INSTRUCTIONS},
+                                                               {"role": "user", "content": "Hello"}]}
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {_secret('LLM_API_KEY') or 'none'}"}
+    try:
+        req = urllib.request.Request(f"{LLM_URL}/chat/completions", json.dumps(body).encode(), headers)
+        urllib.request.urlopen(req, timeout=60).read()
+    except Exception as exc:
+        print(f"LLM warmup skipped ({type(exc).__name__}); is LLM_BASE_URL reachable?")
 
 
 def prewarm(proc: JobProcess):
     MLX.submit(_load_models).result()
-    if LLM_BACKEND == "local":
-        _warm_local_llm()
+    _warm_llm()
 
 
 async def entrypoint(ctx: JobContext):

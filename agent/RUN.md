@@ -1,4 +1,4 @@
-# Kayal: a real-time voice call agent (LiveKit + Deepgram + GPT-6 Luna + Maya-2)
+# Kayal: a real-time voice call agent (LiveKit + Deepgram + any OpenAI-compatible LLM + Maya-2)
 
 Kayal is an AI friend you can call from a browser on your Wi-Fi. She speaks casual spoken Chennai Tamil by default
 and switches to English when you speak English.
@@ -6,17 +6,18 @@ and switches to English when you speak English.
 | Stage | What runs it | Where |
 |---|---|---|
 | Speech to text | Deepgram Nova-3 streaming, `language=multi` (Tamil/English code-switching); local Whisper large-v3-turbo (MLX) without a key | Cloud / Mac |
-| Thinking | GPT-6 Luna on AWS Bedrock (`global.openai.gpt-6-luna`, ap-south-1, reasoning effort low); `LLM_BACKEND=local` for a local MLX model | Cloud / Mac |
+| Thinking | Any OpenAI-compatible chat API (`LLM_BASE_URL`, `LLM_MODEL`); by default a local MLX model on `mlx_lm.server` | Cloud / Mac |
 | Voice | Maya-2 on MLX (this repo), voice Kayal | Mac |
 | Calls | LiveKit server + LiveKit Agents | Mac |
 
-Measured in scripted bilingual calls on an M4 Max: median **1.8 s** from the caller stopping to hearing Kayal.
+Measured in scripted bilingual calls on an M4 Max, with GPT-6 Luna (reasoning effort low) through an OpenAI-compatible
+gateway: median **1.8 s** from the caller stopping to hearing Kayal.
 
 | Stage | Median |
 |---|---|
 | Transcript ready | 0.48 s |
 | End-of-turn decision | 0.51 s |
-| Luna's first token | 0.72 s |
+| LLM's first token | 0.72 s |
 | Maya's first audio | 0.14 s |
 
 ## Setup (macOS on Apple Silicon)
@@ -26,7 +27,7 @@ From this `agent/` folder:
 ```bash
 brew install livekit caddy
 uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python .. "livekit-agents[silero,openai]~=1.8" "livekit-plugins-aws~=1.8" "livekit-plugins-deepgram~=1.8" livekit-api mlx-whisper boto3
+uv pip install --python .venv/bin/python .. "livekit-agents[silero,openai]~=1.8" "livekit-plugins-deepgram~=1.8" livekit-api mlx-whisper
 cp ../.env.example ../.env
 ```
 
@@ -66,9 +67,11 @@ Browsers allow the microphone only on https pages, so the warning can't be avoid
 ## Options (environment variables)
 
 - `STT_BACKEND=whisper`: on-device speech recognition instead of Deepgram.
-- `LLM_BACKEND=local`: a local `mlx_lm.server` on port 18090 instead of Bedrock. Start it with
+- `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`: any OpenAI-compatible chat API, such as OpenAI itself, a
+  [LiteLLM](https://docs.litellm.ai) gateway in front of a provider that has no OpenAI-compatible endpoint, or Ollama.
+- `LLM_REASONING_EFFORT`: e.g. `low` for reasoning models (halved the first-token time in our measurements).
+- With nothing set, the agent uses a local `mlx_lm.server` on port 18090. Start it with
   `uvx --python 3.12 --from mlx-lm mlx_lm.server --model mlx-community/Qwen3-4B-Instruct-2507-4bit --port 18090`.
-- `BEDROCK_MODEL`: any Bedrock model or inference profile.
 - `MAYA_VOICE`: any Maya-2 voice.
 - `CALL_LANGS`: Whisper's languages, e.g. `en,ta,hi`.
 
@@ -94,6 +97,6 @@ timings to `turns.jsonl`. These outputs are gitignored because they contain call
   framework tries LiveKit Cloud inference.
 - **Openings first.** Kayal opens each reply with a few words, so the voice starts before the LLM's first long
   sentence is finished.
-- **A per-turn language note to the LLM.** The prompt rule alone let Luna answer English questions in Tamil.
+- **A per-turn language note to the LLM.** The prompt rule alone let the LLM answer English questions in Tamil.
 - **Misheard scripts are read by sound.** Deepgram sometimes writes Tamil speech in Telugu script or as
   Spanish-looking words; Kayal is told to read those as Tamil.

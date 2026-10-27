@@ -11,7 +11,7 @@ one stream at a time, with every component checked against the original PyTorch 
 **What's here:**
 - **[`maya2_mlx/`](maya2_mlx):** the MLX inference port. Also on Hugging Face:
   [aruntemme/maya2-native-mlx](https://huggingface.co/aruntemme/maya2-native-mlx).
-- **[`agent/`](agent):** Kayal, a voice call agent built on it with LiveKit, Deepgram and GPT-6 Luna. She speaks
+- **[`agent/`](agent):** Kayal, a voice call agent built on it with LiveKit, Deepgram and any OpenAI-compatible LLM. She speaks
   casual Tamil and English, and you can call her from any browser on your Wi-Fi. See [`agent/RUN.md`](agent/RUN.md).
 - **[`parity/`](parity):** the checks against the original PyTorch code, with [raw results](parity/results.txt).
 - **[`patches/maya2-mps.patch`](patches/maya2-mps.patch):** a small patch that lets the official PyTorch engine run
